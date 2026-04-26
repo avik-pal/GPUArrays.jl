@@ -1,31 +1,78 @@
-function cartesian_iter(state, res, A, Asize)
-    for i in CartesianIndices(Asize)
-        res[i] = A[i]
-    end
-    return
+@kernel function cartesian_iter(res, A)
+    i = @index(Global, Cartesian)
+    res[i] = A[i]
 end
 
-function clmap!(ctx, f, out, b)
-    i = linear_index(ctx) # get the kernel index it gets scheduled on
+@kernel function clmap!(f, out, b)
+    i = @index(Global, Linear) # get the kernel index it gets scheduled on
     out[i] = f(b[i])
-    return
 end
 
-function ntuple_test(ctx, result, ::Val{N}) where N
+@kernel function ntuple_test(result, ::Val{N}) where N
     result[1] = ntuple(Val(N)) do i
         Float32(i) * 77f0
     end
-    return
 end
 
-function ntuple_closure(ctx, result, ::Val{N}, testval) where N
+@kernel function ntuple_closure(result, ::Val{N}, testval) where N
     result[1] = ntuple(Val(N)) do i
         Float32(i) * testval
     end
-    return
 end
 
 @testsuite "base" (AT, eltypes)->begin
+    if AT <: AbstractGPUArray
+        @testset "storage" begin
+          x = AT(rand(Float32, 10))
+          @test GPUArrays.storage(x) isa GPUArrays.DataRef
+          GPUArrays.unsafe_free!(x)
+        end
+    end
+
+    @testset "issorted" begin
+        # basic sorted / unsorted
+        @test compare(issorted, AT, [1, 2, 3, 4])
+        @test compare(x -> !issorted(x), AT, [1, 3, 2, 4])
+
+        # reverse ordering
+        @test compare(x -> issorted(x; rev = true), AT, [4, 3, 2, 1])
+        @test compare(x -> !issorted(x; rev = true), AT, [1, 2, 3])
+
+        # custom lt
+        @test compare(x -> issorted(x; lt = >), AT, [3, 2, 1])
+        @test compare(x -> !issorted(x; lt = >), AT, [1, 2, 3])
+
+        # by = abs
+        @test compare(x -> issorted(x; by = abs), AT, [-1, -2, -3])
+        @test compare(x -> !issorted(x; by = abs), AT, [-1, -3, -2])
+
+        # order keyword normalization
+        @test compare(
+            x -> issorted(x; order = Base.Order.Reverse),
+            AT,
+            [3, 2, 1],
+        )
+
+        @test compare(
+            x -> !issorted(x; order = Base.Order.Reverse),
+            AT,
+            [1, 2, 3],
+        )
+
+        # edge cases
+        @test compare(issorted, AT, Int[])
+        @test compare(issorted, AT, [42])
+
+        # unsupported custom orderings
+        AT <: AbstractGPUArray && @testset "unsupported orderings" begin
+            x = AT([1, 2, 3])
+            @test_throws ArgumentError issorted(
+                x;
+                order = Base.Order.By(identity),
+            )
+        end
+    end
+
     @testset "copy!" begin
         for (dst, src,) in (
                             (rand(Float32, (10,)),   rand(Float32, (10,))),   # vectors
@@ -191,10 +238,10 @@ end
 
     AT <: AbstractGPUArray && @testset "ntuple test" begin
         result = AT(Vector{NTuple{3, Float32}}(undef, 1))
-        gpu_call(ntuple_test, result, Val(3))
+        ntuple_test(get_backend(result))(result, Val(3); ndrange = 1)
         @test Array(result)[1] == (77, 2*77, 3*77)
         x = 88f0
-        gpu_call(ntuple_closure, result, Val(3), x)
+        ntuple_closure(get_backend(result))(result, Val(3), x; ndrange = 1)
         @test Array(result)[1] == (x, 2*x, 3*x)
     end
 
@@ -202,14 +249,14 @@ end
         Ac = rand(Float32, 32, 32)
         A = AT(Ac)
         result = fill!(copy(A), 0.0f0)
-        gpu_call(cartesian_iter, result, A, size(A))
+        cartesian_iter(get_backend(A))(result, A; ndrange = size(A))
         Array(result) == Ac
     end
 
     AT <: AbstractGPUArray && @testset "Custom kernel from Julia function" begin
         x = AT(rand(Float32, 100))
         y = AT(rand(Float32, 100))
-        gpu_call(clmap!, -, x, y; target=x)
+        clmap!(get_backend(x))(-, x, y; ndrange = size(x))
         jy = Array(y)
         @test map!(-, jy, jy) ≈ Array(x)
     end
@@ -330,9 +377,18 @@ end
       end
 
       @test compare(x->view(x, :, 1:4, 3), AT, rand(Float32, 5, 4, 3))
+      @test compare(x->view(x, Base.Slice(Base.OneTo(5)), 1:4, 3), AT, rand(Float32, 5, 4, 3))
 
       let x = AT(rand(Float32, 5, 4, 3))
         @test_throws BoundsError view(x, :, :, 1:10)
+      end
+
+      @testset "selectdim" begin
+        @test compare(x -> selectdim(x, 3, 1), AT, rand(Float32, 2, 2, 2))
+        let x = AT(rand(Float32, 5, 4, 3))
+          @test typeof(selectdim(x, 3, 1)) == typeof(view(x, :, :, 1))         
+          @test typeof(selectdim(x, 2, 1)) == typeof(view(x, :, 1, :))
+        end
       end
 
       # bug in parentindices conversion
@@ -365,6 +421,54 @@ end
           @test compare(view, AT, a, i)
           @test compare(view, AT, a, view(i, 2:2))
       end
+
+      # mixed AbstractUnitRange indices: contiguity must be determined at
+      # runtime since the type `UnitRange` doesn't encode length (#2653).
+      # GPU-only: the "contiguous view collapses to AT" behavior is provided by
+      # GPUArrays' `unsafe_contiguous_view`; `Base.view` on a plain `Array`
+      # always returns a `SubArray`.
+      if AT <: AbstractGPUArray
+        @testset "mixed range contiguity" begin
+          A = AT(rand(Float32, 5, 4))
+          B = AT(rand(Float32, 5, 4, 3))
+
+          # contiguous cases: should collapse to the array type itself
+          @test view(A, 1:1, 1:1) isa AT
+          @test view(A, 1:2, 1:1) isa AT
+          @test view(A, 1:5, 1:2) isa AT
+          @test view(A, 1:5, 2:3) isa AT
+          @test view(B, 1:1, 1:1, 1:1) isa AT
+          @test view(B, 1:5, 1:4, 1:1) isa AT
+          @test view(B, 1:5, 2:3, 1:1) isa AT
+          @test view(B, 1:5, 2:3, 2:2) isa AT
+          @test view(B, 1:5, 2:3, 2)   isa AT
+          @test view(B, 1:5, 1:4, 2:3) isa AT
+
+          # non-contiguous cases: must stay as SubArray
+          @test view(A, 1:2, 1:2)      isa SubArray
+          @test view(A, 1:1, 2:3)      isa SubArray
+          @test view(B, 1:5, 1:1, 1:2) isa SubArray
+          @test view(B, 1:5, 1:2, 1:2) isa SubArray
+          @test view(B, 1:2, 1:2, 1:1) isa SubArray
+
+          # values must match in all cases
+          Acpu = Array(A); Bcpu = Array(B)
+          for idx in [(1:1,1:1), (1:4,1:2), (1:5,2:3), (1:2,1:2), (1:1,2:3)]
+              @test Array(view(A, idx...)) == view(Acpu, idx...)
+          end
+          for idx in [(1:5,2:3,1:1), (1:5,2:3,2), (1:5,1:4,2:3),
+                      (1:5,1:1,1:2), (1:5,1:2,1:2), (1:2,1:2,1:1)]
+              @test Array(view(B, idx...)) == view(Bcpu, idx...)
+          end
+
+          # reshape of a 1-element view (original report in #2653)
+          let C = AT(rand(ComplexF32, 4, 5))
+              v = @view C[1:1, 1:1]
+              @test v isa AT
+              @test reshape(v, (1, 1)) isa AT
+          end
+        end
+      end
     end
 
     @testset "reshape" begin
@@ -386,6 +490,13 @@ end
 
       @test collect(reinterpret(Int32, AT(fill(1f0))))[] == reinterpret(Int32, 1f0)
 
+      @testset "reinterpret of view with non-aligned offset" begin
+        a = AT(Int32[1,2,3,4,5,6,7,8,9])
+        v = view(a, 2:7)  # offset of 1 Int32 = 4 bytes
+        r = reinterpret(Int64, v)  # Int64 = 8 bytes; 4 is not a multiple of 8
+        @test Array(r) == reinterpret(Int64, @view Array(a)[2:7])
+      end
+
       @testset "reinterpret(reshape)" begin
         a = AT(ComplexF32[1.0f0+2.0f0*im, 2.0f0im, 3.0f0im])
         b = reinterpret(reshape, Float32, a)
@@ -396,9 +507,11 @@ end
         end
         @test(Array(b) == [1.0 0.0 0.0; 2.0 2.0 3.0],
               broken=(AT <: Array &&
-                      VERSION >= v"1.11.0-DEV.727" &&      # broken in JuliaLang/julia#51760
-                      !(v"1.11-rc1" <= VERSION < v"1.12-")) # reverted in -rc1
-             )
+                        (v"1.11.0-DEV.727" <= VERSION < v"1.11.0-beta2" || # broken in JuliaLang/julia#51760 & reverted in beta2
+                          v"1.12.0-" <= VERSION < v"1.12.0-DEV.528"
+                        )
+                      )
+              )
 
         a = AT(Float32[1.0 0.0 0.0; 2.0 2.0 3.0])
         b = reinterpret(reshape, ComplexF32, a)

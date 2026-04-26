@@ -1,4 +1,4 @@
-Manifest.toml
+Manifest*.toml
 
 *.jl.cov
 *.jl.*.cov
@@ -12,3 +12,5 @@ Manifest.toml
 
 # MacOS generated files
 *.DS_Store
+
+/.vscode

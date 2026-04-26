@@ -143,6 +143,9 @@ function broadcasting(AT, eltypes)
             @test compare(AT, rand(ET, 2,2), rand(ET, 2)) do x,y
                 map!(+, x, y)
             end
+            @test compare(AT, rand(ET, 2), 1:2) do x, y
+                map!(+, x, y)
+            end
         end
 
         @testset "map $ET" begin
@@ -153,6 +156,11 @@ function broadcasting(AT, eltypes)
                 map(+, x, y)
             end
             @test compare(AT, rand(ET, 2,2), rand(ET, 2)) do x,y
+                map(+, x, y)
+            end
+            ############
+            # issue #598
+            @test compare(AT, rand(ET, ()), rand(ET, ())) do x, y
                 map(+, x, y)
             end
         end
@@ -200,8 +208,9 @@ Base.size(A::WrapArray) = size(A.data)
 # For kernal support
 Adapt.adapt_structure(to, s::WrapArray) = WrapArray(Adapt.adapt(to, s.data))
 # For broadcast support
-GPUArrays.backend(::Type{WrapArray{T,N,P}}) where {T,N,P} = GPUArrays.backend(P)
 Broadcast.BroadcastStyle(::Type{WrapArray{T,N,P}}) where {T,N,P} = Broadcast.BroadcastStyle(P)
+KernelAbstractions.get_backend(a::WA) where WA <: WrapArray = get_backend(a.data)
+
 
 function unknown_wrapper(AT, eltypes)
     for ET in eltypes

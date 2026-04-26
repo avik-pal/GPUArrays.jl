@@ -3,7 +3,7 @@
 
 # storage handling
 
-export DataRef
+export DataRef, unsafe_free!
 
 # DataRef provides a helper class to manage the storage of an array.
 #
@@ -53,17 +53,20 @@ end
 
 # per-object state, with a flag to indicate whether the object has been freed.
 # this is to support multiple calls to `unsafe_free!` on the same object,
-# while only lowering the referene count of the underlying data once.
+# while only lowering the reference count of the underlying data once.
 mutable struct DataRef{D}
     rc::RefCounted{D}
     freed::Bool
+    cached::Bool
 end
 
-function DataRef(finalizer, data::D) where {D}
-    rc = RefCounted{D}(data, finalizer, Threads.Atomic{Int}(1))
-    DataRef{D}(rc, false)
+function DataRef(finalizer, ref::D) where {D}
+    rc = RefCounted{D}(ref, finalizer, Threads.Atomic{Int}(1))
+    DataRef{D}(rc, false, false)
 end
-DataRef(data; kwargs...) = DataRef(nothing, data; kwargs...)
+DataRef(ref; kwargs...) = DataRef(nothing, ref; kwargs...)
+
+Base.sizeof(ref::DataRef) = sizeof(ref.rc[])
 
 function Base.getindex(ref::DataRef)
     if ref.freed
@@ -77,10 +80,16 @@ function Base.copy(ref::DataRef{D}) where {D}
         throw(ArgumentError("Attempt to copy a freed reference."))
     end
     retain(ref.rc)
-    return DataRef{D}(ref.rc, false)
+    # copies of cached references are not managed by the cache, so
+    # we need to mark them as such to make sure their refcount can drop.
+    return DataRef{D}(ref.rc, false, false)
 end
 
-function unsafe_free!(ref::DataRef, args...)
+function unsafe_free!(ref::DataRef)
+    if ref.cached
+        # lifetimes of cached references are tied to the cache.
+        return
+    end
     if ref.freed
         # multiple frees *of the same object* are allowed.
         # we should only ever call `release` once per object, though,
@@ -88,9 +97,22 @@ function unsafe_free!(ref::DataRef, args...)
         return
     end
     ref.freed = true
-    release(ref.rc, args...)
+    release(ref.rc)
     return
 end
+
+# array methods
+
+storage(x::AbstractGPUArray) = error("Not implemented") # COV_EXCL_LINE
+
+"""
+    unsafe_free!(a::GPUArray)
+
+Release the memory of an array for reuse by future allocations. This operation is
+performed automatically by the GC when an array goes out of scope, but can be called
+earlier to reduce pressure on the memory allocator.
+"""
+unsafe_free!(x::AbstractGPUArray) = unsafe_free!(storage(x))
 
 
 # input/output
@@ -99,8 +121,8 @@ end
 
 using Serialization: AbstractSerializer, serialize_type
 
-function Serialization.serialize(s::AbstractSerializer, t::T) where T <: AbstractGPUArray
-    serialize_type(s, T)
+function Serialization.serialize(s::AbstractSerializer, @nospecialize(t::AbstractGPUArray))
+    serialize_type(s, typeof(t))
     serialize(s, Array(t))
 end
 
@@ -114,16 +136,17 @@ end
 struct ToArray end
 Adapt.adapt_storage(::ToArray, xs::AbstractGPUArray) = convert(Array, xs)
 
-# display
-Base.print_array(io::IO, X::AnyGPUArray) =
+# display: show is called on the materialised CPU copy, so no need to
+# specialize the forwarders per element type / wrapper.
+Base.print_array(io::IO, @nospecialize(X::AnyGPUArray)) =
     Base.print_array(io, adapt(ToArray(), X))
 
 # show
-Base._show_nonempty(io::IO, X::AnyGPUArray, prefix::String) =
+Base._show_nonempty(io::IO, @nospecialize(X::AnyGPUArray), prefix::String) =
     Base._show_nonempty(io, adapt(ToArray(), X), prefix)
-Base._show_empty(io::IO, X::AnyGPUArray) =
+Base._show_empty(io::IO, @nospecialize(X::AnyGPUArray)) =
     Base._show_empty(io, adapt(ToArray(), X))
-Base.show_vector(io::IO, v::AnyGPUArray, args...) =
+Base.show_vector(io::IO, @nospecialize(v::AnyGPUArray), args...) =
     Base.show_vector(io, adapt(ToArray(), v), args...)
 
 ## collect to CPU (discarding wrapper type)
@@ -159,13 +182,11 @@ for (D, S) in ((AnyGPUArray, Array),
 end
 
 # kernel-based variant for copying between wrapped GPU arrays
-
-function linear_copy_kernel!(ctx::AbstractKernelContext, dest, dstart, src, sstart, n)
-    i = linear_index(ctx)-1
-    if i < n
-        @inbounds dest[dstart+i] = src[sstart+i]
+@kernel function linear_copy_kernel!(dest, dstart, src, sstart, n)
+    i = @index(Global, Linear)
+    if i <= n
+        @inbounds dest[dstart+i-1] = src[sstart+i-1]
     end
-    return
 end
 
 function Base.copyto!(dest::AnyGPUArray, dstart::Integer,
@@ -175,10 +196,8 @@ function Base.copyto!(dest::AnyGPUArray, dstart::Integer,
     destinds, srcinds = LinearIndices(dest), LinearIndices(src)
     (checkbounds(Bool, destinds, dstart) && checkbounds(Bool, destinds, dstart+n-1)) || throw(BoundsError(dest, dstart:dstart+n-1))
     (checkbounds(Bool, srcinds, sstart)  && checkbounds(Bool, srcinds, sstart+n-1))  || throw(BoundsError(src,  sstart:sstart+n-1))
-
-    gpu_call(linear_copy_kernel!,
-             dest, dstart, src, sstart, n;
-             elements=n)
+    kernel = linear_copy_kernel!(get_backend(dest))
+    kernel(dest, dstart, src, sstart, n; ndrange=n)
     return dest
 end
 
@@ -228,13 +247,9 @@ end
 
 ## generalized blocks of heterogeneous memory
 
-function cartesian_copy_kernel!(ctx::AbstractKernelContext, dest, dest_offsets, src, src_offsets, shape, length)
-    i = linear_index(ctx)
-    if i <= length
-        idx = CartesianIndices(shape)[i]
-        @inbounds dest[idx + dest_offsets] = src[idx + src_offsets]
-    end
-    return
+@kernel function cartesian_copy_kernel!(dest, dest_offsets, src, src_offsets)
+    I = @index(Global, Cartesian)
+    @inbounds dest[I + dest_offsets] = src[I + src_offsets]
 end
 
 function Base.copyto!(dest::AnyGPUArray{<:Any, N}, destcrange::CartesianIndices{N},
@@ -255,9 +270,8 @@ function Base.copyto!(dest::AnyGPUArray{<:Any, N}, destcrange::CartesianIndices{
 
     dest_offsets = first(destcrange) - oneunit(CartesianIndex{N})
     src_offsets = first(srccrange) - oneunit(CartesianIndex{N})
-    gpu_call(cartesian_copy_kernel!,
-             dest, dest_offsets, src, src_offsets, shape, len;
-             elements=len)
+    kernel = cartesian_copy_kernel!(get_backend(dest))
+    kernel(dest, dest_offsets, src, src_offsets; ndrange=shape)
     dest
 end
 
@@ -311,7 +325,7 @@ end
 
 Base.copy(x::AbstractGPUArray) = error("Not implemented") # COV_EXCL_LINE
 
-Base.deepcopy(x::AbstractGPUArray) = copy(x)
+Base.deepcopy_internal(@nospecialize(x::AbstractGPUArray), ::IdDict) = copy(x)
 
 
 # filtering
@@ -332,7 +346,7 @@ end
 
 # this is needed because copyto! of most GPU arrays
 # doesn't currently support Tuple sources
-function Base.append!(a::AbstractGPUVector, items::Tuple)
+function Base.append!(a::AbstractGPUVector, @nospecialize(items::Tuple))
     append!(a, collect(items))
     return a
 end

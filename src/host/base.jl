@@ -1,11 +1,51 @@
 # common Base functionality
 import Base: _RepeatInnerOuter
 
+@kernel function issorted_kernel!(
+        data,
+        violations,
+        ord,
+    )
+    i = @index(Global)
+    if i <= length(violations)
+        @inbounds begin
+            a = data[i]
+            b = data[i + 1]
+            violations[i] = Base.Order.lt(ord, b, a)
+        end
+    end
+end
+
+function Base.issorted(A::AbstractGPUArray; lt::Function = isless, by::Function = identity, rev::Bool = false, order = Base.Order.Forward)
+    if order === Base.Order.Reverse
+        rev = !rev
+        order = Base.Order.Forward
+    elseif order !== Base.Order.Forward
+        throw(ArgumentError("custom orderings are not supported on GPU"))
+    end
+
+    n = length(A)
+    n ≤ 1 && return true
+
+    ord = Base.Order.ord(lt, by, rev, order)
+
+    violations = similar(A, Bool, n - 1)
+    backend = get_backend(A)
+
+    issorted_kernel!(backend)(
+        A,
+        violations,
+        ord,
+        ndrange = n - 1,
+    )
+
+    return !any(Array(violations))
+end
+
 # Handle `out = repeat(x; inner)` by parallelizing over `out` array This can benchmark
 # faster if repeating elements along the first axis (i.e. `inner=(n, ones...)`), as data
 # access can be contiguous on write.
-function repeat_inner_dst_kernel!(
-    ctx::AbstractKernelContext,
+@kernel function repeat_inner_dst_kernel!(
     xs::AbstractArray{<:Any, N},
     inner::NTuple{N, Int},
     out::AbstractArray{<:Any, N}
@@ -13,27 +53,25 @@ function repeat_inner_dst_kernel!(
     # Get the "stride" index in each dimension, where the size
     # of the stride is given by `inner`. The stride-index (sdx) then
     # corresponds to the index of the repeated value in `xs`.
-    odx = @cartesianidx out
+    odx = @index(Global, Cartesian)
     dest_inds = odx.I
     sdx = ntuple(N) do i
         @inbounds (dest_inds[i] - 1) ÷ inner[i] + 1
     end
     @inbounds out[odx] = xs[CartesianIndex(sdx)]
-    return nothing
 end
 
 # Handle `out = repeat(x; inner)` by parallelizing over the `xs` array This tends to
 # benchmark faster by having fewer read operations and avoiding the costly division
 # operation. Additionally, when repeating over the trailing dimension. `inner=(ones..., n)`,
 # data access can be contiguous during both the read and write operations.
-function repeat_inner_src_kernel!(
-    ctx::AbstractKernelContext,
+@kernel function repeat_inner_src_kernel!(
     xs::AbstractArray{<:Any, N},
     inner::NTuple{N, Int},
     out::AbstractArray{<:Any, N}
 ) where {N}
     # Get single element from src
-    idx = @cartesianidx xs
+    idx = @index(Global, Cartesian)
     @inbounds val = xs[idx]
 
     # Loop over "repeat" indices of inner
@@ -44,7 +82,6 @@ function repeat_inner_src_kernel!(
         end
         @inbounds out[CartesianIndex(odx)] = val
     end
-    return nothing
 end
 
 function repeat_inner(xs::AnyGPUArray, inner)
@@ -64,23 +101,24 @@ function repeat_inner(xs::AnyGPUArray, inner)
     # relevant benchmarks.
     if argmax(inner) == firstindex(inner)
         # Parallelize over the destination array
-        gpu_call(repeat_inner_dst_kernel!, xs, inner, out; elements=prod(size(out)))
+        kernel = repeat_inner_dst_kernel!(get_backend(out))
+        kernel(xs, inner, out; ndrange=size(out))
     else
         # Parallelize over the source array
-        gpu_call(repeat_inner_src_kernel!, xs, inner, out; elements=prod(size(xs)))
+        kernel = repeat_inner_src_kernel!(get_backend(xs))
+        kernel(xs, inner, out; ndrange=size(xs))
     end
     return out
 end
 
-function repeat_outer_kernel!(
-    ctx::AbstractKernelContext,
+@kernel function repeat_outer_kernel!(
     xs::AbstractArray{<:Any, N},
     xssize::NTuple{N},
     outer::NTuple{N},
     out::AbstractArray{<:Any, N}
 ) where {N}
     # Get index to input element
-    idx = @cartesianidx xs
+    idx = @index(Global, Cartesian)
     @inbounds val = xs[idx]
 
     # Loop over repeat indices, copying val to out
@@ -91,14 +129,13 @@ function repeat_outer_kernel!(
         end
         @inbounds out[CartesianIndex(odx)] = val
     end
-
-    return nothing
 end
 
 function repeat_outer(xs::AnyGPUArray, outer)
     out = similar(xs, eltype(xs), outer .* size(xs))
     any(==(0), size(out)) && return out # consistent with `Base.repeat`
-    gpu_call(repeat_outer_kernel!, xs, size(xs), outer, out; elements=length(xs))
+    kernel = repeat_outer_kernel!(get_backend(xs))
+    kernel(xs, size(xs), outer, out; ndrange=size(xs))
     return out
 end
 
@@ -276,15 +313,30 @@ end
 ## views
 
 struct Contiguous end
+struct MaybeContiguous end
 struct NonContiguous end
 
 # NOTE: this covers more cases than the I<:... in Base.FastContiguousSubArray
 GPUIndexStyle() = Contiguous()
 GPUIndexStyle(I...) = NonContiguous()
 GPUIndexStyle(::Union{Base.ScalarIndex, CartesianIndex}...) = Contiguous()
-GPUIndexStyle(i1::Colon, ::Union{Base.ScalarIndex, CartesianIndex}...) = Contiguous()
-GPUIndexStyle(i1::AbstractUnitRange, ::Union{Base.ScalarIndex, CartesianIndex}...) = Contiguous()
-GPUIndexStyle(i1::Colon, I...) = GPUIndexStyle(I...)
+GPUIndexStyle(::Colon, ::Union{Base.ScalarIndex, CartesianIndex}...) = Contiguous()
+GPUIndexStyle(::Base.Slice, ::Union{Base.ScalarIndex, CartesianIndex}...) = Contiguous()
+GPUIndexStyle(::AbstractUnitRange, ::Union{Base.ScalarIndex, CartesianIndex}...) = Contiguous()
+GPUIndexStyle(::Colon, I...) = GPUIndexStyle(I...)
+GPUIndexStyle(::Base.Slice, I...) = GPUIndexStyle(I...)
+# Two or more adjacent AbstractUnitRange indices can't be classified statically;
+# whether the view is contiguous depends on the lengths of the ranges (e.g.
+# `view(A, 1:1, 1:1)` is contiguous, but `view(A, 1:2, 1:2)` is not). Defer
+# those cases to a runtime stride check.
+GPUIndexStyle(::AbstractUnitRange, ::AbstractUnitRange,
+              ::Vararg{Union{AbstractUnitRange, Base.ScalarIndex, CartesianIndex}}) =
+    MaybeContiguous()
+# Disambiguate the above from the recursive `Base.Slice` rule: a leading Slice
+# covers a full dimension and should be stripped, regardless of what follows.
+GPUIndexStyle(::Base.Slice, i2::AbstractUnitRange,
+              I::Vararg{Union{AbstractUnitRange, Base.ScalarIndex, CartesianIndex}}) =
+    GPUIndexStyle(i2, I...)
 
 viewlength() = ()
 @inline viewlength(::Real, I...) = viewlength(I...) # skip scalar
@@ -321,4 +373,37 @@ end
 
 @inline function unsafe_view(A, I, ::NonContiguous)
     Base.unsafe_view(Base._maybe_reshape_parent(A, Base.index_ndims(I...)), I...)
+end
+
+@inline function unsafe_view(A, I, ::MaybeContiguous)
+    P = Base._maybe_reshape_parent(A, Base.index_ndims(I...))
+    if iscontiguous_indices(P, I)
+        unsafe_contiguous_view(P, I, viewlength(I...))
+    else
+        Base.unsafe_view(P, I...)
+    end
+end
+
+# Determine at runtime whether the view `I` into `A` covers a contiguous
+# stretch of memory. Length-1 range indices (and scalars) don't affect the
+# traversal stride; each longer range index must sit at the expected parent
+# stride and advances it by its length.
+@inline iscontiguous_indices(A, I::Tuple) = _iscontiguous_indices(strides(A), I, 1, 1)
+@inline _iscontiguous_indices(::Tuple, ::Tuple{}, dim::Int, expected::Int) = true
+@inline function _iscontiguous_indices(st::Tuple, I::Tuple, dim::Int, expected::Int)
+    idx = I[1]
+    rest = Base.tail(I)
+    if idx isa AbstractUnitRange
+        len = Base.length(idx)
+        if len == 1
+            _iscontiguous_indices(st, rest, dim+1, expected)
+        else
+            @inbounds st[dim] == expected || return false
+            @inbounds _iscontiguous_indices(st, rest, dim+1, st[dim] * len)
+        end
+    elseif idx isa CartesianIndex
+        _iscontiguous_indices(st, rest, dim+length(idx), expected)
+    else # Base.ScalarIndex
+        _iscontiguous_indices(st, rest, dim+1, expected)
+    end
 end

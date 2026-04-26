@@ -170,6 +170,30 @@ end
         let x = rand(Float32, 10, 10)
             @test findfirst(>(0.5f0), x) == findfirst(>(0.5f0), AT(x))
         end
+
+        # empty
+        @test compare(findfirst, AT, Bool[])
+        @test compare(x->findfirst(>(0.5f0), x), AT, Float32[])
+    end
+    @testset "findlast" begin
+        # 1D
+        @test compare(findlast, AT, rand(Bool, 100))
+        @test compare(x->findlast(>(0.5f0), x), AT, rand(Float32, 100))
+        let x = fill(false, 10)
+            @test findlast(x) == findlast(AT(x))
+        end
+
+        # ND
+        let x = rand(Bool, 10, 10)
+            @test findlast(x) == findlast(AT(x))
+        end
+        let x = rand(Float32, 10, 10)
+            @test findlast(>(0.5f0), x) == findlast(>(0.5f0), AT(x))
+        end
+
+        # empty
+        @test compare(findlast, AT, Bool[])
+        @test compare(x->findlast(>(0.5f0), x), AT, Float32[])
     end
 
     @testset "findmax & findmin" begin
@@ -180,6 +204,14 @@ end
             x[32] = x[33] = x[55] = x[66] = NaN32
             @test isequal(findmax(x), findmax(AT(x)))
             @test isequal(findmax(x; dims=1), Array.(findmax(AT(x); dims=1)))
+        end
+        let x = randn(Float32, 100)
+            @test findmax(abs, x) == findmax(abs, AT(x))
+            @test findmax(abs, x; dims=1) == Array.(findmax(abs, AT(x); dims=1))
+
+            x[32] = x[33] = x[55] = x[66] = NaN32
+            @test isequal(findmax(abs, x), findmax(abs, AT(x)))
+            @test isequal(findmax(abs, x; dims=1), Array.(findmax(abs, AT(x); dims=1)))
         end
         let x = rand(Float32, 10, 10)
             @test findmax(x) == findmax(AT(x))
@@ -210,6 +242,14 @@ end
             x[32] = x[33] = x[55] = x[66] = NaN32
             @test isequal(findmin(x), findmin(AT(x)))
             @test isequal(findmin(x; dims=1), Array.(findmin(AT(x); dims=1)))
+        end
+        let x = randn(Float32, 100)
+            @test findmin(abs, x) == findmin(abs, AT(x))
+            @test findmin(abs, x; dims=1) == Array.(findmin(abs, AT(x); dims=1))
+
+            x[32] = x[33] = x[55] = x[66] = NaN32
+            @test isequal(findmin(abs, x), findmin(abs, AT(x)))
+            @test isequal(findmin(abs, x; dims=1), Array.(findmin(abs, AT(x); dims=1)))
         end
         let x = rand(Float32, 10, 10)
             @test findmin(x) == findmin(AT(x))

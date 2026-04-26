@@ -1,31 +1,25 @@
 @testsuite "random" (AT, eltypes)->begin
     rng = if AT <: AbstractGPUArray
-        GPUArrays.default_rng(AT)
+        GPUArrays.RNG{AT}()
     else
         Random.default_rng()
     end
-    cpu_rng = Random.default_rng()
 
     @testset "rand" begin  # uniform
-        for T in eltypes, d in (10, (10,10))
+        @testset "$T $d" for T in eltypes, d in (2, (2,2), (2,2,2))
             A = AT{T}(undef, d)
             B = copy(A)
             rand!(rng, A)
             rand!(rng, B)
             @test Array(A) != Array(B)
-
-            Random.seed!(rng)
-            Random.seed!(rng, 1)
-            rand!(rng, A)
-            Random.seed!(rng, 1)
-            rand!(rng, B)
-            @test all(Array(A) .== Array(B))
-
-            if rng != cpu_rng
-                rand!(cpu_rng, A)
-            end
         end
 
+        # empty arrays
+        B = AT{Float32}(undef, 0)
+        rand!(rng, B)
+        @test isempty(Array(B))
+
+        # Bool coverage
         A = AT{Bool}(undef, 1024)
         fill!(A, false)
         rand!(rng, A)
@@ -33,40 +27,65 @@
         fill!(A, true)
         rand!(rng, A)
         @test false in Array(A)
-
-        # AT of length 0
-        B = AT{Float32}(undef, 0)
-        fill!(B, 1f0)
-        rand!(rng, B)
-        @test isempty(Array(B))
     end
 
     @testset "randn" begin  # normally-distributed
-        # XXX: randn calls sqrt, and Base's sqrt(::Complex) performs
-        #      checked type conversions that throw boxed numbers.
-        for T in filter(isrealfloattype, eltypes), d in (2, (2,2))
+        @testset "$T $d" for T in filter(isrealfloattype, eltypes),
+                              d in (2, (2,2), (2,2,2))
             A = AT{T}(undef, d)
             B = copy(A)
             randn!(rng, A)
             randn!(rng, B)
             @test Array(A) != Array(B)
-
-            Random.seed!(rng)
-            Random.seed!(rng, 1)
-            randn!(rng, A)
-            Random.seed!(rng, 1)
-            randn!(rng, B)
-            @test Array(A) == Array(B)
-
-            if rng != cpu_rng
-                randn!(cpu_rng, A)
-            end
         end
 
-        # AT of length 0
+        # complex randn
+        for T in filter(t -> t <: Complex && isrealfloattype(real(t)), eltypes)
+            A = AT{T}(undef, 8)
+            randn!(rng, A)
+            @test !any(isnan, Array(A))
+        end
+
+        # empty arrays
         A = AT{Float32}(undef, 0)
-        fill!(A, 1f0)
         randn!(rng, A)
         @test isempty(Array(A))
+
+        # Box-Muller should not produce infinities
+        if Float32 in eltypes
+            @test isfinite(maximum(randn!(rng, AT{Float32}(undef, 2^20))))
+        end
+    end
+
+    @testset "seeding" begin
+        if AT <: AbstractGPUArray
+            # seeding should produce reproducible results
+            for T in (Float32, Float64)
+                if T in eltypes
+                    Random.seed!(rng, 1)
+                    A = rand!(rng, AT{T}(undef, 100))
+                    Random.seed!(rng, 1)
+                    B = rand!(rng, AT{T}(undef, 100))
+                    @test Array(A) == Array(B)
+
+                    Random.seed!(rng, 1)
+                    A = randn!(rng, AT{T}(undef, 100))
+                    Random.seed!(rng, 1)
+                    B = randn!(rng, AT{T}(undef, 100))
+                    @test Array(A) == Array(B)
+                end
+            end
+        end
+    end
+
+    # a CPU RNG into a GPU array should route through a CPU generate + copyto!,
+    # not the stdlib scalar setindex! fallback
+    if AT <: AbstractGPUArray && Float32 in eltypes
+        @testset "CPU RNG → GPU array" begin
+            cpu_rng = MersenneTwister(1)
+            A = AT{Float32}(undef, 16)
+            @test (rand!(cpu_rng, A); true)
+            @test (randn!(cpu_rng, A); true)
+        end
     end
 end

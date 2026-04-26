@@ -72,7 +72,7 @@ end
     Is = map(adapt(ToGPU(dest)), Is)
     @boundscheck checkbounds(src, Is...)
 
-    gpu_call(getindex_kernel, dest, src, idims, Is...)
+    getindex_kernel(get_backend(dest))(dest, src, idims, Is...; ndrange=size(dest))
     return dest
 end
 
@@ -82,15 +82,16 @@ end
     return vectorized_getindex!(dest, src, Is...)
 end
 
-@generated function getindex_kernel(ctx::AbstractKernelContext, dest, src, idims,
-                                    Is::Vararg{Any,N}) where {N}
+@kernel function getindex_kernel(dest, src, idims, Is...)
+    i = @index(Global, Linear)
+    getindex_generated(dest, src, idims, i, Is...)
+end
+@generated function getindex_generated(dest, src, idims, i, Is::Vararg{Any,N}) where {N}
     quote
-        i = @linearidx dest
         is = @inbounds CartesianIndices(idims)[i]
         @nexprs $N i -> I_i = @inbounds(Is[i][is[i]])
         val = @ncall $N getindex src i -> I_i
         @inbounds dest[i] = val
-        return
     end
 end
 
@@ -111,15 +112,17 @@ end
     Is = map(adapt(ToGPU(dest)), Is)
     @boundscheck checkbounds(dest, Is...)
 
-    gpu_call(setindex_kernel, dest, adapt(ToGPU(dest), src), idims, len, Is...;
-             elements=len)
+    setindex_kernel(get_backend(dest))(dest, adapt(ToGPU(dest), src), idims, len, Is...;
+             ndrange = length(dest))
     return dest
 end
 
-@generated function setindex_kernel(ctx::AbstractKernelContext, dest, src, idims, len,
-                                    Is::Vararg{Any,N}) where {N}
+@kernel function setindex_kernel(dest, src, idims, len, Is...)
+    i = @index(Global, Linear)
+    setindex_generated(dest, src, idims, len, i, Is...)
+end
+@generated function setindex_generated(dest, src, idims, len, i, Is::Vararg{Any,N}) where {N}
     quote
-        i = linear_index(ctx)
         i > len && return
         is = @inbounds CartesianIndices(idims)[i]
         @nexprs $N i -> I_i = @inbounds(Is[i][is[i]])
@@ -187,37 +190,43 @@ Base.size(ei::EachIndex) = ei.dims
 Base.getindex(ei::EachIndex, i::Int) = ei.indices[i]
 Base.IndexStyle(::Type{<:EachIndex}) = Base.IndexLinear()
 
-function Base.findfirst(f::Function, A::AnyGPUArray)
-    indices = EachIndex(A)
-    dummy_index = first(indices)
-
-    # given two pairs of (istrue, index), return the one with the smallest index
-    function reduction(t1, t2)
+function findfirstlast_reduction(op_and_dummy, t1, t2)
+    op, dummy_index = op_and_dummy
+    (x, i), (y, j) = t1, t2
+    if op(i, j)
+        t1, t2 = t2, t1
         (x, i), (y, j) = t1, t2
-        if i > j
-            t1, t2 = t2, t1
-            (x, i), (y, j) = t1, t2
-        end
-        x && return t1
-        y && return t2
-        return (false, dummy_index)
     end
-
-    res = mapreduce((x, y)->(f(x), y), reduction, A, indices;
-                    init = (false, dummy_index))
-    if res[1]
-        # out of consistency with Base.findarray, return a CartesianIndex
-        # when the input is a multidimensional array
-        ndims(A) == 1 && return res[2]
-        return CartesianIndices(A)[res[2]]
-    else
-        return nothing
-    end
+    x && return t1
+    y && return t2
+    return (false, dummy_index)
 end
 
-Base.findfirst(A::AnyGPUArray{Bool}) = findfirst(identity, A)
+for (find_f, op, dummy_f) in ((:(Base.findfirst), :>, :first), (:(Base.findlast), :<, :last))
+    @eval begin
+        function $find_f(f::Function, A::AnyGPUArray)
+            isempty(A) && return nothing
+            indices = EachIndex(A)
+            dummy_index = $dummy_f(indices)
 
-function findminmax(binop, A::AnyGPUArray; init, dims)
+            # given two pairs of (istrue, index), return the one with the smallest index
+            res = mapreduce((x, y)->(f(x), y), (a, b)->findfirstlast_reduction(($op, dummy_index), a, b), A, indices;
+                            init = (false, dummy_index))
+            if res[1]
+                # out of consistency with Base.findarray, return a CartesianIndex
+                # when the input is a multidimensional array
+                ndims(A) == 1 && return res[2]
+                return CartesianIndices(A)[res[2]]
+            else
+                return nothing
+            end
+        end
+    end
+end
+Base.findfirst(A::AnyGPUArray{Bool}) = findfirst(identity, A)
+Base.findlast(A::AnyGPUArray{Bool})  = findlast(identity, A)
+
+function findminmax(binop, f, A::AnyGPUArray; init, dims)
     indices = EachIndex(A)
     dummy_index = firstindex(A)
 
@@ -225,18 +234,20 @@ function findminmax(binop, A::AnyGPUArray; init, dims)
         (x, i), (y, j) = t1, t2
 
         binop(x, y) && return t2
-        x == y && return (x, min(i, j))
+        isequal(x, y) && return (x, min(i, j))
         return t1
     end
+    
+    fA = f.(A)
 
     if dims == Colon()
-        res = mapreduce(tuple, reduction, A, indices; init = (init, dummy_index))
+        res = mapreduce(tuple, reduction, fA, indices; init = (init, dummy_index))
 
         # out of consistency with Base.findarray, return a CartesianIndex
         # when the input is a multidimensional array
         return (res[1], ndims(A) == 1 ? res[2] : CartesianIndices(A)[res[2]])
     else
-        res = mapreduce(tuple, reduction, A, indices;
+        res = mapreduce(tuple, reduction, fA, indices;
                         init = (init, dummy_index), dims=dims)
         vals = map(x->x[1], res)
         inds = map(x->ndims(A) == 1 ? x[2] : CartesianIndices(A)[x[2]], res)
@@ -244,5 +255,7 @@ function findminmax(binop, A::AnyGPUArray; init, dims)
     end
 end
 
-Base.findmax(a::AnyGPUArray; dims=:) = findminmax(Base.isless, a; init=typemin(eltype(a)), dims)
-Base.findmin(a::AnyGPUArray; dims=:) = findminmax(Base.isgreater, a; init=typemax(eltype(a)), dims)
+Base.findmax(a::AnyGPUArray; dims=:) = findminmax(Base.isless, identity, a; init=typemin(eltype(a)), dims)
+Base.findmin(a::AnyGPUArray; dims=:) = findminmax(Base.isgreater, identity, a; init=typemax(eltype(a)), dims)
+Base.findmax(f::Function, a::AnyGPUArray; dims=:) = findminmax(Base.isless, f, a; init=typemin(eltype(a)), dims)
+Base.findmin(f::Function, a::AnyGPUArray; dims=:) = findminmax(Base.isgreater, f, a; init=typemax(eltype(a)), dims)
